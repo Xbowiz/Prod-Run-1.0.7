@@ -306,6 +306,12 @@
           await waitProceedWithErrorWatch('');
 
           stat.textContent = 'Returning to Items tab'; await clickItems(); if (abort) return; await sleep(CUSHION);
+        } else {
+          stat.textContent = 'Click Proceed to continue';
+          btnProc.disabled = false;
+          await waitProceedWithErrorWatch('');
+
+          stat.textContent = 'Returning to Items tab'; await clickItems(); if (abort) return; await sleep(CUSHION);
         }
       }
       if (!abort) {
