@@ -1,0 +1,872 @@
+(() => {
+  /* ========= Inject page-world hook (CSP-safe, no inline) ========= */
+  try {
+    const s = document.createElement('script');
+    s.src = chrome.runtime.getURL('pagehook.js');
+    s.async = false; // ensure it runs ASAP
+    (document.documentElement || document.head).appendChild(s);
+    s.remove();
+  } catch (e) {
+    console.error('Failed to inject pagehook.js', e);
+  }
+
+  /* ========= Helpers ========= */
+  function onBodyReady(cb) {
+    if (document.body) return cb();
+    document.addEventListener('DOMContentLoaded', cb, { once: true });
+  }
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+  /* ========= Config & State ========= */
+  const INPUT = '#itemTxt', CUSHION = 200, UIN_CUSHION = 20;
+  let paused = false, abort = false, inFlight = 0, proceedResolver = null;
+  const collectedErrors = [];
+  let descActivated = false; // <— ensure we activate Resolve header only once
+
+  /* ========= Network idle wiring (listen to page-world events) ========= */
+  document.addEventListener('uin-net', (ev) => {
+    if (ev?.detail?.phase && typeof ev.detail.phase.inFlight === 'number') {
+      inFlight = ev.detail.phase.inFlight;
+    }
+  });
+  // Also patch our own world (covers any XHR/fetch issued by THIS script)
+  {
+    const oOpen = XMLHttpRequest.prototype.open, oSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function (...a) {
+      this.addEventListener('loadend', () => { inFlight--; if (inFlight < 0) inFlight = 0; });
+      return oOpen.apply(this, a);
+    };
+    XMLHttpRequest.prototype.send = function (...a) { inFlight++; return oSend.apply(this, a); };
+    const oFetch = window.fetch;
+    window.fetch = (...a) => { inFlight++; return oFetch(...a).finally(() => { inFlight--; if (inFlight < 0) inFlight = 0; }); };
+  }
+  const waitNet = () => new Promise(r => { const tick = () => inFlight === 0 ? r() : setTimeout(tick, 50); tick(); });
+
+  const pad6 = n => n.toString().padStart(6, '0');
+  const keyEnter = t => new KeyboardEvent(t, { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true });
+  const waitProceed = () => new Promise(r => { proceedResolver = r; });
+  const ensureBox = () => { const el = document.querySelector(INPUT); if (!el) { alert('Open Items tab'); abort = true; } return el; };
+
+  async function waitForElement(selector, timeout = 5000, interval = 100) {
+    const start = Date.now();
+    while (Date.now() - start < timeout) {
+      const el = document.querySelector(selector);
+      if (el) return el;
+      await sleep(interval);
+    }
+    return null;
+  }
+  async function typeText(element, text) {
+    for (let char of text) {
+      element.dispatchEvent(new KeyboardEvent('keydown', { key: char, bubbles: true }));
+      element.value += char;
+      element.dispatchEvent(new Event('input', { bubbles: true }));
+      element.dispatchEvent(new KeyboardEvent('keyup', { key: char, bubbles: true }));
+      await sleep(50);
+    }
+  }
+
+  /* ========= UI (build only after <body> exists) ========= */
+  onBodyReady(() => {
+    const ui = document.createElement('div');
+    ui.id = 'uinSender';
+    ui.style = [
+      'position:fixed;top:20px;right:20px;z-index:9999',
+      'width:260px;padding:12px;background:#983222;overflow:hidden',
+      'border-radius:8px;border:1px solid #000;box-shadow:0 2px 8px rgba(0,0,0,.1)',
+      'font-family:-apple-system,BlinkMacSystem,"Segoe UI",Roboto,sans-serif'
+    ].join(';');
+    ui.innerHTML = `
+        <div id="dragbar" style="cursor:grab;background:linear-gradient(to bottom,#983222,#983222);margin:-12px -12px 8px -12px;padding:8px 12px;border-bottom:1px solid #983222;border-top-left-radius:8px;border-top-right-radius:8px;font-weight:500;color:#fff;text-align:center">UIN Sender V4 - TEST</div>
+        <div style="background:#fff;padding:12px;margin:0 -12px -12px -12px">
+      <div id="inputs" style="display:flex;gap:8px;margin-bottom:8px">
+        <div class="sel-block">
+          <div class="sel-title">UIN List</div>
+          <textarea id="uinList" rows="5" placeholder="Input UINs here" style="width:100%;box-sizing:border-box;border:1px solid #ced4da;border-radius:4px;padding:8px;font-size:14px;resize:vertical"></textarea>
+        </div>
+        <div class="sel-block">
+          <div class="sel-title">SA Corp List</div>
+          <textarea id="saCorpList" rows="5" placeholder="Input SA Corps here" style="width:100%;box-sizing:border-box;border:1px solid #ced4da;border-radius:4px;padding:8px;font-size:14px;resize:vertical"></textarea>
+        </div>
+      </div>
+        <div id="selectors" style="display:flex;gap:8px;margin-bottom:8px">
+          <div class="sel-block">
+            <div class="sel-title">Group Selection</div>
+            <select id="groupMode" style="width:100%;padding:8px;font-size:14px;text-align:center;text-align-last:center">
+              <option value="none" selected>None</option>
+              <option value="all">All</option>
+              <option value="specific">Specific</option>
+            </select>
+          </div>
+          <div class="sel-block">
+            <div class="sel-title">Authorization Code</div>
+            <select id="authCode" style="width:100%;padding:8px;font-size:14px;text-align:center;text-align-last:center">
+              <option value="none" selected>None</option>
+              <option value="0">0</option>
+              <option value="1">1</option>
+              <option value="2">2</option>
+              <option value="3">3</option>
+              <option value="4">4</option>
+              <option value="5">5</option>
+              <option value="6">6</option>
+              <option value="7">7</option>
+              <option value="8">8</option>
+              <option value="9">9</option>
+            </select>
+          </div>
+        </div>
+        <div id="statBox" style="border:2px solid #001F3F;border-radius:4px;padding:8px;text-align:center;margin-top:8px;min-height:20px;background:#f8f9fa;"><span id="stat" style="font-size:14px;font-weight:600;color:#6c757d"></span></div>
+        <div id="controls" style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-top:8px">
+          <button id="go">Start</button>
+          <button id="pause" disabled>Pause</button>
+          <button id="proceed" disabled>Proceed</button>
+          <button id="reset" disabled>Reset</button>
+        </div>
+      <details id="uinDebug" style="margin-top:8px"><summary style="cursor:pointer;color:#6c757d">Debug</summary><div style="display:flex;gap:8px;justify-content:flex-end;margin:4px 0 6px;"><button id="copyDebug" style="background:#6c757d">Copy Debug</button><button id="clearDebug" style="background:#6c757d">Clear</button></div><pre id="uinDebugLog" style="max-height:180px;overflow:auto;background:#f8f9fa;border:1px solid #e9ecef;border-radius:4px;padding:8px;font-size:12px;white-space:pre-wrap;"></pre></details>
+        </div>`;
+    document.body.appendChild(ui);
+
+    const style = document.createElement('style');
+    style.textContent = `
+      #uinSender button{padding:6px 12px;border:none;border-radius:4px;cursor:pointer;font-size:14px;font-weight:500;color:#fff;transition:all .2s;text-align:center}
+      #uinSender button#go,#uinSender button#proceed{background:#001F3F}
+      #uinSender button#go:hover,#uinSender button#proceed:hover{background:#000F1F}
+      #uinSender button#pause{background:#6c757d}
+      #uinSender button#pause:hover{background:#5a6268}
+        #uinSender button#reset{background:#983222;color:#fff}
+        #uinSender button#reset:hover{background:#983222;color:#fff}
+      #uinSender button:disabled{background:#e9ecef;color:#adb5bd;cursor:not-allowed}
+      #uinSender select,
+      #uinSender textarea,
+      #uinSender #stat{
+        text-align:center;
+        text-align-last:center;
+      }
+        #uinSender textarea:focus{outline:none;border-color:#983222;box-shadow:0 0 0 .2rem rgba(152,50,34,.25)}
+        #selectors .sel-block,#inputs .sel-block{flex:1;text-align:center}
+        #selectors .sel-title,#inputs .sel-title{background:linear-gradient(to bottom,#983222,#983222);padding:8px 12px;border-radius:4px;margin-bottom:4px;color:#fff;font-weight:500;white-space:nowrap;font-size:12px}
+      #uinSender #stat.done{color:#28a745}`;
+    document.head.appendChild(style);
+
+    /* DRAG */
+    let drag=false,ox=0,oy=0;
+    ui.querySelector('#dragbar').addEventListener('mousedown',e=>{
+      drag=true;ox=e.clientX-ui.offsetLeft;oy=e.clientY-ui.offsetTop;ui.style.left=ui.offsetLeft+'px';ui.style.right='';
+    });
+    document.addEventListener('mousemove',e=>{if(drag){ui.style.left=`${e.clientX-ox}px`;ui.style.top=`${e.clientY-oy}px`;}});document.addEventListener('mouseup',()=>{drag=false;});
+
+    /* UI refs */
+    const txt = ui.querySelector('#uinList'),
+          saTxt = ui.querySelector('#saCorpList'),
+          btnGo = ui.querySelector('#go'),
+          btnP = ui.querySelector('#pause'),
+          btnR = ui.querySelector('#reset'),
+          btnProc = ui.querySelector('#proceed'),
+          stat = ui.querySelector('#stat');
+
+    // Debug logger
+    const debugEl = ui.querySelector('#uinDebugLog');
+    function dlog(){
+      try {
+        const ts = new Date().toISOString().split('T')[1].replace('Z','');
+        const msg = Array.from(arguments).map(a => {
+          if (a === undefined) return 'undefined';
+          if (a === null) return 'null';
+          if (typeof a === 'object') { try { return JSON.stringify(a); } catch { return String(a); } }
+          return String(a);
+        }).join(' ');
+        if (debugEl) { debugEl.textContent += `[${ts}] ${msg}\n`; }
+        console.log('[UIN DEBUG]', msg);
+      } catch(e) { console.log('[UIN DEBUG:fail]', e); }
+    }
+
+    // Debug controls
+    const btnCopyDbg = ui.querySelector('#copyDebug');
+    const btnClearDbg = ui.querySelector('#clearDebug');
+    if (btnCopyDbg) btnCopyDbg.onclick = async () => {
+      try {
+        const text = debugEl ? debugEl.textContent : '';
+        if (navigator.clipboard && window.isSecureContext) {
+          await navigator.clipboard.writeText(text);
+          if (stat) stat.textContent = 'Debug log copied to clipboard.';
+        } else {
+          const ta = document.createElement('textarea');
+          ta.value = text;
+          document.body.appendChild(ta);
+          ta.select();
+          document.execCommand('copy');
+          ta.remove();
+          if (stat) stat.textContent = 'Debug log copied to clipboard (fallback).';
+        }
+      } catch (e) { dlog('copy fail', e && e.message); }
+    };
+    if (btnClearDbg) btnClearDbg.onclick = () => { if (debugEl) debugEl.textContent = ''; if (stat) stat.textContent = 'Debug log cleared.'; };
+
+    /* --- define reset BEFORE assigning handlers --- */
+    async function reset() {
+      abort = true; paused = false;
+      txt.disabled = saTxt.disabled = false;
+      btnGo.disabled = false; btnP.disabled = true; btnP.textContent = 'Pause';
+      btnR.disabled = btnProc.disabled = true;
+      if (proceedResolver) proceedResolver(); proceedResolver = null;
+      collectedErrors.length = 0;
+      stat.textContent = ''; stat.classList.remove('done');
+      await clickItems();
+      await clickRemoveAll();
+      const box = document.querySelector(INPUT);
+      if (box) box.value = '';
+      txt.value = ''; saTxt.value = '';
+    }
+
+    /* BUTTONS */
+    btnP.onclick = () => { paused = !paused; btnP.textContent = paused ? 'Resume' : 'Pause'; };
+    btnR.onclick = reset;
+    btnProc.onclick = () => { if (proceedResolver) { proceedResolver(); proceedResolver = null; btnProc.disabled = true; } };
+
+    /* MAIN */
+    btnGo.onclick = async () => {
+      const uins = txt.value.trim().split(/[\s,]+/).filter(Boolean).map(pad6),
+            saList = saTxt.value.trim().split(/[\s,]+/).filter(Boolean),
+            authCode = ui.querySelector('#authCode').value,
+            groupMode = ui.querySelector('#groupMode').value;
+
+      collectedErrors.length = 0;
+
+      if (!uins.length) { alert('No UINs'); return; }
+      txt.disabled = saTxt.disabled = true; btnGo.disabled = true; btnP.disabled = false; btnR.disabled = false; abort = false;
+
+      stat.textContent = 'Processing...';
+
+      if (saList.length > 0) {
+        for (let j = 0; j < saList.length; j++) {
+          if (abort) break; while (paused) await sleep(200);
+          stat.textContent = `Changing to SA Corp ${saList[j]} (${j + 1}/${saList.length})`;
+          await changeSaCorp(saList[j]); if (abort) break;
+          for (let i = 0; i < uins.length; i++) {
+            if (abort) break; while (paused) await sleep(200);
+            const box = ensureBox(); if (!box || abort) break;
+            box.value = uins[i];
+            box.dispatchEvent(new Event('input', { bubbles: true }));
+            box.dispatchEvent(keyEnter('keydown'));
+            box.dispatchEvent(keyEnter('keyup'));
+            stat.textContent = `SA ${saList[j]} - ${i + 1}/${uins.length}`;
+            await waitNet(); await sleep(UIN_CUSHION);
+          }
+          if (abort) break; await sleep(500);
+
+          if (groupMode !== 'none') {
+            stat.textContent = 'Handling Group Selection';
+            await handleGroupSelection(groupMode, saList[j] || ''); if (abort) break;
+          }
+
+            if (groupMode !== 'none' || authCode !== 'none') {
+              stat.textContent = 'Switching to Mass Maint. tab – Configure & Click Proceed';
+              await clickMass(); if (abort) break;
+              if (authCode !== 'none') await selectAuthCode(authCode);
+              btnProc.disabled = false;
+              await waitProceedWithErrorWatch(saList[j] || '');
+
+              stat.textContent = 'Returning to Items tab'; await clickItems(); if (abort) break; await sleep(CUSHION);
+            } else {
+              stat.textContent = 'Click Proceed to continue';
+              btnProc.disabled = false;
+              await waitProceedWithErrorWatch(saList[j] || '');
+
+              stat.textContent = 'Returning to Items tab';
+              await clickItems(); if (abort) break;
+              await sleep(CUSHION);
+            }
+        }
+      } else {
+        stat.textContent = 'Switching to Items tab'; await clickItems(); if (abort) return;
+
+        for (let i = 0; i < uins.length; i++) {
+          if (abort) break; while (paused) await sleep(200);
+          const box = ensureBox(); if (!box || abort) break;
+          box.value = uins[i];
+          box.dispatchEvent(new Event('input', { bubbles: true }));
+          box.dispatchEvent(keyEnter('keydown'));
+          box.dispatchEvent(keyEnter('keyup'));
+          stat.textContent = `${i + 1}/${uins.length}`;
+          await waitNet(); await sleep(UIN_CUSHION);
+        }
+
+        if (abort) return; await sleep(500);
+
+          if (groupMode !== 'none') {
+            stat.textContent = 'Handling Group Selection';
+            await handleGroupSelection(groupMode, ''); if (abort) return;
+          }
+
+        if (groupMode !== 'none' || authCode !== 'none') {
+          stat.textContent = 'Switching to Mass Maint. tab – Configure & Click Proceed';
+          await clickMass(); if (abort) return;
+          if (authCode !== 'none') await selectAuthCode(authCode);
+          btnProc.disabled = false;
+          await waitProceedWithErrorWatch('');
+
+          stat.textContent = 'Returning to Items tab'; await clickItems(); if (abort) return; await sleep(CUSHION);
+        }
+      }
+      if (!abort) {
+        stat.textContent = '✔ Done';
+        stat.classList.add('done');
+        if (collectedErrors.length) {
+          downloadExceptionsCsv(collectedErrors);
+          collectedErrors.length = 0;
+        }
+      }
+      txt.disabled = saTxt.disabled = false; btnGo.disabled = false; btnP.disabled = true;
+    };
+
+    /* ======= functions used in main flow ======= */
+    async function clickItems(){for(let i=0;i<3;i++){const cap=[...document.querySelectorAll('.v-button-caption')].find(e=>e.textContent.startsWith('Items'));if(cap){cap.closest('.v-button').click();await waitNet();await sleep(CUSHION);return;}await sleep(300);}alert('Items tab missing');abort=true;}
+    async function clickMass(){for(let i=0;i<3;i++){const cap=[...document.querySelectorAll('.v-button-caption')].find(e=>e.textContent.trim().startsWith('Mass Maint'));if(cap){cap.closest('.v-button').click();await waitNet();await sleep(CUSHION);return;}await sleep(300);}alert('Mass Maint. tab missing');abort=true;}
+
+    async function clickGroups(){
+      for(let i=0;i<3;i++){
+        const cap = [...document.querySelectorAll('.v-button-caption')].find(e => e.textContent.trim().startsWith('Group'));
+        if(cap){cap.closest('.v-button').click();await waitNet();await sleep(CUSHION);return;}
+        await sleep(300);
+      }
+      alert('Groups button missing');abort=true;
+    }
+
+    async function clickRemoveAll() {
+      const btn = await waitForElement('#removeAllButton');
+      if (!btn) { alert('Remove All button not found'); abort = true; return; }
+      const el = btn.closest('.v-button') || btn;
+      el.click();
+      await waitNet();
+      await sleep(CUSHION);
+    }
+
+    /* === Error harvesting helpers === */
+    async function waitProceedWithErrorWatch(saCtx) {
+      let stop = false;
+      const watcher = (async () => {
+        while (!stop && !abort) {
+          await sleep(200);
+          const dlg = document.querySelector('.v-window-error');
+          if (!dlg) continue; dlog('Error dialog detected');
+          const btnCap = [...dlg.querySelectorAll('.v-button-caption')];
+          const viewBtnCap = btnCap.find(el => el.textContent.trim().toLowerCase().includes('view errors'));
+          const cancelBtnCap = btnCap.find(el => el.textContent.trim().toLowerCase().includes('cancel'));
+          if (viewBtnCap) { dlog('Click View Errors');
+            (viewBtnCap.closest('.v-button') || viewBtnCap).click();
+            await waitNet(); await sleep(CUSHION);
+          } else if (cancelBtnCap) { dlog('Click Cancel');
+            (cancelBtnCap.closest('.v-button') || cancelBtnCap).click();
+            await waitNet(); await sleep(CUSHION);
+          }
+          await ensureExceptionsOpen();
+          let harvested = await harvestExceptionsByDescriptions(saCtx);
+          if (!harvested) { harvested = await scrapeExceptions(saCtx); }
+          if (harvested > 0 && stat) { stat.textContent = 'Exceptions captured (' + harvested + '). You can click Proceed.'; }
+          break;
+        }
+      })();
+
+      await waitProceed();
+      stop = true;
+      await watcher;
+    }
+
+    async function ensureExceptionsOpen(){
+      const hasGrid = document.querySelector('tbody.v-grid-body');
+      if (hasGrid) { dlog('Exceptions grid present already'); return; }
+      const cap = [...document.querySelectorAll('.v-button-caption')]
+        .find(e => e.textContent.trim().startsWith('Exceptions'));
+      if (cap) { dlog('Clicking Exceptions tab'); cap.closest('.v-button').click(); await waitNet(); await sleep(CUSHION); }
+      else { dlog('Exceptions tab not found'); }
+    }
+
+    function getGridScroller(gridBody){
+      const cand = [];
+      const grid = gridBody.closest('.v-grid');
+      if (grid) {
+        const a = grid.querySelector('.v-grid-scroller'); if (a) cand.push(a);
+        const b = grid.querySelector('.v-grid-body-wrapper'); if (b) cand.push(b);
+      }
+      let n = gridBody; for (let i=0;i<8&&n;i++){ cand.push(n); n = n.parentElement; }
+      const uniq = Array.from(new Set(cand.filter(Boolean)));
+      for (const c of uniq) {
+        const cs = getComputedStyle(c);
+        const can = c.scrollHeight > c.clientHeight + 5 || /(auto|scroll)/.test(cs.overflowY);
+        dlog('scroller cand', c.className || c.id || c.tagName, 'h=', c.scrollHeight, 'ch=', c.clientHeight, 'ovY=', cs.overflowY);
+        if (can) return c;
+      }
+      dlog('fallback scroller = gridBody');
+      return gridBody;
+    }
+
+    function collapseWS(s){
+      if (!s) return '';
+      let out = '';
+      let wasSpace = false;
+      for (let i = 0; i < s.length; i++) {
+        const code = s.charCodeAt(i);
+        const isSpace = code <= 32;
+        if (isSpace) {
+          if (!wasSpace) { out += ' '; wasSpace = true; }
+        } else {
+          out += s[i];
+          wasSpace = false;
+        }
+      }
+      return out.trim();
+    }
+
+    /* ===== Resolve-header aware table refs (no hard-coded description text) ===== */
+    function getDescTableRefs() {
+      // Look for a header element that contains "Resolve" (case-insensitive)
+      const headers = Array.from(document.querySelectorAll('.v-table-header, .v-table-header-wrap, .v-table-header-cell'));
+      const isResolve = (el) => (el.textContent || '').toLowerCase().includes('resolve');
+      const resolveHeader = headers.find(isResolve) || null;
+
+      // Find the associated table near that header; fall back to first table
+      const tables = Array.from(document.querySelectorAll('.v-table-table'));
+      let table = null;
+
+      if (resolveHeader) {
+        // Scan a few siblings
+        let n = resolveHeader;
+        for (let i = 0; i < 5 && n && !table; i++) {
+          n = n.nextElementSibling;
+          if (n && n.matches && n.matches('.v-table-table')) table = n;
+          if (!table && n) table = n.querySelector?.('.v-table-table') || table;
+        }
+        // Ancestor search as backup
+        if (!table) {
+          let p = resolveHeader.parentElement;
+          for (let i = 0; i < 4 && p && !table; i++) {
+            table = p.querySelector?.('.v-table-table') || null;
+            p = p.parentElement;
+          }
+        }
+      }
+      if (!table) table = tables[0] || null;
+
+      const body =
+        document.querySelector('.v-table-body') ||
+        document.querySelector('.v-table-body-wrapper') ||
+        table?.closest('.v-scrollable') ||
+        table?.parentElement || null;
+
+      return { table, body, resolveHeader };
+    }
+
+    /* === Positively activate/focus the table by clicking Resolve header once === */
+      async function ensureDescTableActive() {
+        const { table, body, resolveHeader } = getDescTableRefs();
+        dlog('ensureDescTableActive entry', { tableFound: !!table, bodyFound: !!body });
+        if (!table || !body) { dlog('ensureDescTableActive abort: missing table/body'); dlog('ensureDescTableActive result', false); return false; }
+
+        // Click "Resolve" header ONCE (avoids sorting churn on Description)
+        if (!descActivated && resolveHeader) {
+          const hr = resolveHeader.getBoundingClientRect();
+          const hx = Math.max(6, Math.min(hr.left + hr.width * 0.6, hr.right - 6)); // right-ish click
+          const hy = hr.top + Math.min(hr.height - 6, Math.max(6, hr.height * 0.5));
+          dlog('ensureDescTableActive click resolveHeader', { x: hx, y: hy });
+          resolveHeader.dispatchEvent(new MouseEvent('mousedown', { clientX: hx, clientY: hy, bubbles: true }));
+          resolveHeader.dispatchEvent(new MouseEvent('mouseup',   { clientX: hx, clientY: hy, bubbles: true }));
+          descActivated = true;
+          await sleep(80);
+        }
+
+        // If no header, click first visible cell
+        if (!descActivated) {
+          const firstCell = table.querySelector('.v-table-cell-content') || table.querySelector('tr.v-table-row');
+          if (firstCell) {
+            const r = firstCell.getBoundingClientRect();
+            const x = r.left + Math.min(40, Math.max(8, r.width * 0.2));
+            const y = r.top + Math.max(8, Math.min(r.height - 8, r.height * 0.5));
+            dlog('ensureDescTableActive click firstCell', { x, y });
+            firstCell.dispatchEvent(new MouseEvent('mousedown', { clientX: x, clientY: y, bubbles: true }));
+            firstCell.dispatchEvent(new MouseEvent('mouseup',   { clientX: x, clientY: y, bubbles: true }));
+            descActivated = true;
+            await sleep(80);
+          }
+        }
+
+        // Give the grid keyboard focus by targeting the body wrapper
+        if (body) {
+          if (body.tabIndex < 0) {
+            try { body.tabIndex = 0; } catch {}
+          }
+          try { body.focus(); } catch {}
+          dlog(
+            'ensureDescTableActive focused',
+            body.tagName || '(unknown)',
+            body.className || ''
+          );
+        }
+        dlog('ensureDescTableActive result', descActivated);
+        return true;
+      }
+
+    async function clickResolveHeader(){
+      const { resolveHeader } = getDescTableRefs();
+      if (!resolveHeader) return;
+      const hr = resolveHeader.getBoundingClientRect();
+      const hx = Math.max(6, Math.min(hr.left + hr.width * 0.6, hr.right - 6));
+      const hy = hr.top + Math.min(hr.height - 6, Math.max(6, hr.height * 0.5));
+      resolveHeader.dispatchEvent(new MouseEvent('mousedown', { clientX: hx, clientY: hy, bubbles: true }));
+      resolveHeader.dispatchEvent(new MouseEvent('mouseup',   { clientX: hx, clientY: hy, bubbles: true }));
+      await waitNet();
+      await sleep(160);
+    }
+
+    async function getExceptionDescription(){
+      const sels = [
+        '.v-table-table .v-label.v-widget.v-has-width',
+        '.v-table-table .v-label.v-widget',
+        '.v-table-cell-content .v-label.v-widget',
+        '.v-label.v-widget.v-has-width'
+      ];
+      for (const sel of sels){
+        const el = await waitForElement(sel, 1000);
+        if (el){
+          const t = (el.textContent || '').trim();
+          if (t) return t;
+        }
+      }
+      return '';
+    }
+
+    async function scrapeExceptions(saCtx) {
+      const gridBody = await waitForElement('tbody.v-grid-body', 3000);
+      if (!gridBody) return 0;
+      const desc = await getExceptionDescription(); dlog('exception desc=', desc || '(none)');
+      const scroller = getGridScroller(gridBody);
+      const seen = new Set();
+      const collect = () => {
+        const cells = gridBody.querySelectorAll('.v-grid-row .v-grid-cell');
+        cells.forEach(td => {
+          let t = (td.textContent || '');
+          t = collapseWS(t);
+          if (t) seen.add(t);
+        });
+      };
+      dlog('scrape start', 'visibleRows=', gridBody.querySelectorAll('.v-grid-row').length, 'top=', scroller.scrollTop, 'h=', scroller.scrollHeight, 'ch=', scroller.clientHeight);
+      scroller.scrollTop = 0; collect(); await sleep(180);
+      let guard = 0, lastTop = -1, lastSeen = 0, stable = 0, reason = 'guard limit';
+      while (guard++ < 2000) {
+        if (scroller.scrollTop === lastTop) stable++; else stable = 0;
+        lastTop = scroller.scrollTop;
+        const step = Math.max(40, Math.floor(scroller.clientHeight * 0.6));
+        scroller.scrollTop = Math.min(scroller.scrollTop + step, scroller.scrollHeight);
+        await sleep(200);
+        collect();
+        const grown = seen.size - lastSeen; lastSeen = seen.size;
+        dlog('step', guard, 'top=', scroller.scrollTop, 'grown=', grown, 'seen=', seen.size, 'stable=', stable);
+        if ((scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 2) && grown === 0) { reason = 'scroll completion'; break; }
+        if (stable >= 8 && grown === 0) { reason = 'stable threshold'; break; }
+      }
+      dlog('scroll end','top=', scroller.scrollTop, 'h=', scroller.scrollHeight, 'seen=', seen.size, 'reason=', reason);
+      const saVal = (typeof getCurrentSaCode === 'function' ? getCurrentSaCode() : '') || saCtx || '';
+      const keyset = new Set(collectedErrors.map(e => (e.sa + '|' + (e.desc||'') + '|' + e.text)));
+      for (const t of seen) {
+        const key = saVal + '|' + (desc || '') + '|' + t;
+        if (!keyset.has(key)) collectedErrors.push({ sa: saVal, text: t, desc });
+      }
+      return seen.size;
+    }
+
+    /* ===== Keyboard/scroll-driven walker over descriptions (dynamic) ===== */
+    async function harvestExceptionsByDescriptions(saCtx) {
+    const { table, body } = getDescTableRefs();
+    const hasTable = !!table;
+    const hasBody = !!body;
+    let rowCount = hasTable ? table.querySelectorAll('.v-table-table tr').length : 0;
+    dlog('harvest(desc) entry', { descActivated, rowCount, hasTable, hasBody });
+    if (!table || !body) { dlog('desc table/body not found'); return 0; }
+
+    if (!descActivated) {
+      await clickResolveHeader();
+      descActivated = true;
+    }
+
+    rowCount = table.querySelectorAll('.v-table-table tr').length;
+    dlog('harvest(desc) init', { descActivated, rowCount });
+
+    await ensureDescTableActive();
+
+      // Read “current” description across Vaadin themes; no fixed strings
+      const readCurrent = () => {
+        const sel =
+          table.querySelector('tr[aria-selected="true"]') ||
+          table.querySelector('tr.v-selected, tr.v-table-row.v-selected') ||
+          table.querySelector('tr.v-table-row');
+        if (!sel) return '';
+        const lbl = sel.querySelector('.v-label') || sel;
+        return collapseWS((lbl.textContent || '').trim());
+      };
+
+      // Ensure something is selected
+      let cur = readCurrent();
+      if (!cur) {
+        const first = table.querySelector('tr.v-table-row');
+        if (first) {
+          const r = first.getBoundingClientRect();
+          first.dispatchEvent(new MouseEvent('mousedown', { clientX: r.left + 8, clientY: r.top + r.height / 2, bubbles: true }));
+          first.dispatchEvent(new MouseEvent('mouseup',   { clientX: r.left + 8, clientY: r.top + r.height / 2, bubbles: true }));
+          await waitNet(); await sleep(140);
+          cur = readCurrent();
+        }
+      }
+
+      const KEYCODES = { ArrowDown: 40, ArrowUp: 38, PageDown: 34, PageUp: 33 };
+
+      const pressKey = async (key) => {
+        const active = document.activeElement || body;
+        const code = KEYCODES[key] || 0;
+        active.dispatchEvent(new KeyboardEvent('keydown', { key, code: key, keyCode: code, which: code, bubbles: true }));
+        active.dispatchEvent(new KeyboardEvent('keyup',   { key, code: key, keyCode: code, which: code, bubbles: true }));
+        await waitNet(); await sleep(160);
+      };
+
+        const advance = async () => {
+          const before = readCurrent();
+          let after;
+
+          dlog('advance attempt', { method: 'ArrowDown', before });
+          await pressKey('ArrowDown');
+          after = readCurrent();
+          dlog('advance attempt result', { method: 'ArrowDown', before, after });
+          if (after && after !== before) {
+            dlog('advance result', { before, after, success: true });
+            return true;
+          }
+
+          dlog('advance attempt', { method: 'ArrowUp+ArrowDown', before });
+          await pressKey('ArrowUp');
+          await pressKey('ArrowDown');
+          after = readCurrent();
+          dlog('advance attempt result', { method: 'ArrowUp+ArrowDown', before, after });
+          if (after && after !== before) {
+            dlog('advance result', { before, after, success: true });
+            return true;
+          }
+
+          dlog('advance attempt', { method: 'PageDown', before });
+          await pressKey('PageDown');
+          after = readCurrent();
+          dlog('advance attempt result', { method: 'PageDown', before, after });
+          if (after && after !== before) {
+            dlog('advance result', { before, after, success: true });
+            return true;
+          }
+
+          dlog('advance attempt', { method: 'scroll', before });
+          try { body.scrollTop = Math.min(body.scrollTop + Math.floor(body.clientHeight * 0.7), body.scrollHeight); } catch {}
+          await sleep(220);
+          after = readCurrent();
+          dlog('advance attempt result', { method: 'scroll', before, after });
+          if (after && after !== before) {
+            dlog('advance result', { before, after, success: true });
+            return true;
+          }
+
+          // Final fallback: compute index and click the next row directly
+          dlog('advance attempt', { method: 'rowIndex', before });
+          const rows = Array.from(table.querySelectorAll('.v-table-table tr'));
+          const active = document.activeElement?.closest('tr');
+          const idx = rows.findIndex(r =>
+            r === active ||
+            r.matches('[aria-selected="true"], .v-selected, .v-table-row.v-selected')
+          );
+          const row = idx >= 0 ? rows[idx + 1] : undefined;
+          row?.click();
+          await waitNet(); await sleep(160);
+          after = readCurrent();
+          dlog('advance attempt result', { method: 'rowIndex', before, after });
+          const success = !!row && !!after && after !== before;
+          dlog('advance result', { before, after, success });
+          return success;
+        };
+
+    const visited = new Set();
+    let total = 0;
+    while (true) {
+      const curText = readCurrent();
+      dlog('desc loop start', { curText, visited: visited.size });
+      if (!curText || visited.has(curText)) break;
+      visited.add(curText);
+
+      dlog('desc selected', curText.slice(0, 80));
+      const added = await scrapeExceptionsForDesc(saCtx, curText);
+      dlog('scrapeExceptionsForDesc returned', { added });
+      dlog('desc harvested', added, curText.slice(0, 80));
+      total += added;
+
+      let moved = await advance();
+      dlog('advance result', { moved, attempt: 1 });
+      if (!moved) {
+        dlog('advance retry via ensureDescTableActive');
+        await ensureDescTableActive(); // focus may have been stolen by popups
+        moved = await advance();
+        dlog('advance result', { moved, attempt: 2 });
+      }
+      if (!moved) break;
+    }
+
+    dlog('desc iterate done', 'visited=', visited.size, 'total=', total);
+    return total;
+  }
+
+    async function scrapeExceptionsForDesc(saCtx, descText) {
+      const gridBody = await waitForElement('tbody.v-grid-body', 3000);
+      if (!gridBody) return 0;
+      const scroller = getGridScroller(gridBody);
+      const seen = new Set();
+      const collect = () => {
+        const cells = gridBody.querySelectorAll('.v-grid-row .v-grid-cell');
+        cells.forEach(td => {
+          let t = td.textContent || '';
+          t = collapseWS(t);
+          if (t) seen.add(t);
+        });
+      };
+      dlog('scrape(desc) start', 'desc=', (descText||'').slice(0,60), 'top=', scroller.scrollTop, 'h=', scroller.scrollHeight, 'ch=', scroller.clientHeight);
+      scroller.scrollTop = 0; collect(); await sleep(180);
+      let guard = 0, lastTop = -1, lastSeen = 0, stable = 0, reason = 'guard limit';
+      while (guard++ < 2000) {
+        if (scroller.scrollTop === lastTop) stable++; else stable = 0;
+        lastTop = scroller.scrollTop;
+        const step = Math.max(40, Math.floor(scroller.clientHeight * 0.6));
+        scroller.scrollTop = Math.min(scroller.scrollTop + step, scroller.scrollHeight);
+        await sleep(200);
+        collect();
+        const grown = seen.size - lastSeen; lastSeen = seen.size;
+        dlog('scrape(desc) step', guard, 'top=', scroller.scrollTop, 'grown=', grown, 'seen=', seen.size, 'stable=', stable);
+        if ((scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 2) && grown === 0) { reason = 'scroll completion'; break; }
+        if (stable >= 8 && grown === 0) { reason = 'stable threshold'; break; }
+      }
+      dlog('scrape(desc) end','desc=', (descText||'').slice(0,60), 'top=', scroller.scrollTop, 'h=', scroller.scrollHeight, 'seen=', seen.size, 'reason=', reason);
+      const saVal = (typeof getCurrentSaCode === 'function' ? getCurrentSaCode() : '') || saCtx || '';
+      const keyset = new Set(collectedErrors.map(e => (e.sa + '|' + (e.desc||'') + '|' + e.text)));
+      for (const t of seen) {
+        const key = saVal + '|' + (descText || '') + '|' + t;
+        if (!keyset.has(key)) collectedErrors.push({ sa: saVal, text: t, desc: descText || '' });
+      }
+      return seen.size;
+    }
+
+    function tsString(d){
+      const pad = n => String(n).padStart(2,'0');
+      return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+    }
+
+    function getCurrentSaCode(){
+      try {
+        const el = document.querySelector('#SaCorpNameContainer');
+        if (!el) return '';
+        const raw = (el.textContent || '').trim();
+        if (!raw) return '';
+        const left = raw.split(' - ')[0].trim();
+        return left || raw;
+      } catch { return ''; }
+    }
+
+    function downloadExceptionsCsv(rows){
+      const map = new Map();
+      for (const r of rows) {
+        const k = `${r.sa}|${r.desc||''}|${r.text}`;
+        if (!map.has(k)) map.set(k, r);
+      }
+      const unique = Array.from(map.values());
+      const NL = String.fromCharCode(10);
+      const header = 'Description,SA Corp,Error' + NL;
+      const body = unique.map(r => {
+        const desc = (r.desc||'');
+        const sa = (r.sa||'');
+        const t = (r.text||'');
+        const esc = s => s.split('"').join('""');
+        return `"${esc(desc)}","${esc(sa)}","${esc(t)}"`;
+      }).join(NL);
+      const csv = header + body + NL;
+      const blob = new Blob([csv], { type: 'text/csv' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `exceptions_${tsString(new Date())}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(()=>{ URL.revokeObjectURL(a.href); a.remove(); }, 0);
+    }
+
+    async function changeSaCorp(sa) {
+      await clickItems();
+      await sleep(CUSHION);
+      const opt = [...document.querySelectorAll('.v-menubar-menuitem-caption')]
+            .find(e => e.textContent.trim() === 'Options');
+      if (!opt) { alert('Options menu missing'); abort = true; return; }
+      opt.closest('.v-menubar-menuitem').click();
+      await sleep(80);
+
+      const chg = [...document.querySelectorAll('.v-menubar-menuitem-caption')]
+        .find(e => e.textContent.trim() === 'Change SA Corp');
+      if (!chg) { alert('Change SA Corp missing'); abort = true; return; }
+      chg.closest('.v-menubar-menuitem').click();
+      await sleep(200);
+      await waitNet();
+      await sleep(CUSHION);
+
+      const inputEl = await waitForElement('.v-filterselect-input');
+      if (!inputEl) { alert('Cannot find SA Corp input'); abort = true; return; }
+
+      inputEl.focus();
+      inputEl.value = '';
+      await typeText(inputEl, sa);
+      await waitNet();
+      await sleep(100);
+
+      const popupEl = await waitForElement('.v-filterselect-suggestpopup');
+      if (!popupEl) { alert('No suggestion popup for SA Corp'); abort = true; return; }
+
+      inputEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+      inputEl.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+      await waitNet();
+
+      const okBtn = [...document.querySelectorAll('.v-button-caption')]
+        .find(el => el.textContent.trim() === 'OK');
+      if (!okBtn) { alert('Cannot find OK button'); abort = true; return; }
+      okBtn.closest('.v-button').click();
+      await waitNet();
+      await sleep(CUSHION);
+    }
+
+    async function selectAuthCode(code) {
+      if (code === 'none') return;
+      await sleep(200);
+      const table = await waitForElement('.v-table-table');
+      if (!table) { alert('Auth code table not found'); abort = true; return; }
+      const cells = table.querySelectorAll('.v-table-cell-content');
+      const targetCell = Array.from(cells).find(cell => cell.textContent.trim().startsWith(code + '  '));
+      if (!targetCell) { alert('Cannot find auth code cell'); abort = true; return; }
+      const rect = targetCell.getBoundingClientRect();
+      const centerX = rect.left + rect.width / 2;
+      const centerY = rect.top + rect.height / 2;
+      targetCell.dispatchEvent(new MouseEvent('mousedown', { clientX: centerX, clientY: centerY, bubbles: true, cancelable: true, view: window }));
+      await sleep(50);
+      targetCell.dispatchEvent(new MouseEvent('mouseup', { clientX: centerX, clientY: centerY, bubbles: true, cancelable: true, view: window }));
+      await waitNet();
+      await sleep(CUSHION);
+    }
+
+        async function handleGroupSelection(mode, saCtx='') {
+          if (mode === 'none') return;
+          await clickGroups();
+        if (mode === 'all') {
+          const allCheckbox = await waitForElement('.v-grid-select-all-checkbox input');
+          if (!allCheckbox) { alert('Cannot find all checkbox'); abort = true; return; }
+          allCheckbox.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+          await waitNet();
+          await sleep(CUSHION);
+        } else if (mode === 'specific') {
+          btnProc.disabled = false;
+          await waitProceedWithErrorWatch(saCtx);
+        }
+      }
+  }); // end onBodyReady
+})();
